@@ -24,14 +24,14 @@ fi
 # Echo the webroot path
 echo "Webroot for '$APP_NAME': $WEBROOT"
 
-# Create 'test.html' inside the webroot
-echo "HelloWorld" > "$WEBROOT/test.html"
+# Create 'usman.html' inside the webroot
+echo "HelloWorld" > "$WEBROOT/usman.html"
 
 # Confirm file creation
-if [[ -f "$WEBROOT/test.html" ]]; then
-    echo "File 'test.html' created successfully in $WEBROOT"
+if [[ -f "$WEBROOT/usman.html" ]]; then
+    echo "File 'usman.html' created successfully in $WEBROOT"
 else
-    echo "Failed to create 'test.html'"
+    echo "Failed to create 'usman.html'"
     exit 1
 fi
 
@@ -46,7 +46,7 @@ fi
 
 # Extract domains and check for "HelloWorld" response
 grep -oP '(?<=server_name\s)[^;]+' "$CONFIG_FILE" | tr -s ' ' '\n' | sort -u | while read domain; do
-    response=$(curl -sk --max-time 5 "https://$domain/test.html")
+    response=$(curl -sk --max-time 5 "https://$domain/usman.html")
     if [[ "$response" == "HelloWorld" ]]; then
         echo "[✔] $domain: HelloWorld"
     else
