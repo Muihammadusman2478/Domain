@@ -3,12 +3,12 @@
 
 WEBROOT="/opt/letsencrypt"
 
-echo "=========================================="
-echo "       SSL CHECK & CERTBOT DRY RUN"
-echo "=========================================="
+echo "=================================================="
+echo "            CLOUDWAYS SSL DIAGNOSTICS"
+echo "=================================================="
 
-# Check dependencies
-for cmd in openssl certbot curl timeout date; do
+# Check required commands
+for cmd in openssl certbot curl dig timeout date; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "ERROR: Missing command: $cmd"
         exit 1
@@ -19,6 +19,26 @@ if [[ ! -d "$WEBROOT" ]]; then
     echo "ERROR: Webroot not found: $WEBROOT"
     exit 1
 fi
+
+# Server public outgoing IP
+echo
+echo "=================================================="
+echo "                 SERVER PUBLIC IP"
+echo "=================================================="
+
+SERVER_IP=$(curl -4 -ksS --connect-timeout 5 \
+    --max-time 10 https://ipinfo.io/ip 2>/dev/null |
+    tr -d '[:space:]')
+
+if [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo ">>> SERVER PUBLIC IP: $SERVER_IP <<<"
+else
+    SERVER_IP=""
+    echo "Server IP: Unable to detect"
+fi
+
+echo "Note: This is the server's outbound public IPv4."
+echo "It may differ from its inbound application IP."
 
 echo
 read -rp "Enter domain(s), separated by spaces or commas: " INPUT
@@ -51,16 +71,54 @@ echo
 echo "Total Domains: ${#DOMAINS[@]}"
 
 echo
-echo "=========================================="
-echo "          CURRENT SSL DETAILS"
-echo "=========================================="
+echo "=================================================="
+echo "               DNS & SSL CHECKS"
+echo "=================================================="
 
 for domain in "${DOMAINS[@]}"; do
 
     echo
-    echo "------------------------------------------"
+    echo "--------------------------------------------------"
     echo "DOMAIN: $domain"
-    echo "------------------------------------------"
+    echo "--------------------------------------------------"
+
+    echo
+    echo "========== DNS A RECORD =========="
+    A_RECORDS=$(dig +short A "$domain")
+    echo "${A_RECORDS:-No A record found}"
+
+    if [[ -n "$SERVER_IP" ]]; then
+        if printf '%s\n' "$A_RECORDS" |
+            grep -Fxq "$SERVER_IP"; then
+            echo "[MATCH] Domain A record matches outbound server IP"
+        else
+            echo "[INFO] Domain does not match outbound server IP"
+            echo "This alone does not indicate incorrect DNS."
+        fi
+    fi
+
+    echo
+    echo "========== DNS AAAA RECORD =========="
+    AAAA_RECORDS=$(dig +short AAAA "$domain")
+    echo "${AAAA_RECORDS:-No AAAA record found}"
+
+    echo
+    echo "========== DNS CAA RECORD =========="
+    CAA_RECORDS=$(dig +short CAA "$domain")
+    echo "${CAA_RECORDS:-No CAA record at queried name}"
+
+    echo
+    echo "========== DNS NS RECORD =========="
+    NS_RECORDS=$(dig +short NS "$domain")
+    echo "${NS_RECORDS:-No NS record at queried name}"
+
+    echo
+    echo "========== DNS CNAME RECORD =========="
+    CNAME_RECORDS=$(dig +short CNAME "$domain")
+    echo "${CNAME_RECORDS:-No CNAME record found}"
+
+    echo
+    echo "========== CURRENT SSL CERTIFICATE =========="
 
     CERT=$(timeout 12 openssl s_client \
         -connect "${domain}:443" \
@@ -74,53 +132,75 @@ for domain in "${DOMAINS[@]}"; do
         echo "Issue Date : N/A"
         echo "Expiry Date: N/A"
         echo "Days Left  : N/A"
-        continue
-    fi
-
-    ISSUER=$(printf '%s\n' "$CERT" |
-        openssl x509 -noout -issuer)
-
-    START=$(printf '%s\n' "$CERT" |
-        openssl x509 -noout -startdate |
-        cut -d= -f2-)
-
-    END=$(printf '%s\n' "$CERT" |
-        openssl x509 -noout -enddate |
-        cut -d= -f2-)
-
-    END_EPOCH=$(date -u -d "$END" +%s 2>/dev/null)
-    NOW_EPOCH=$(date -u +%s)
-
-    echo "SSL Status : Certificate retrieved"
-    echo "$ISSUER"
-    echo "Issue Date : $START"
-    echo "Expiry Date: $END"
-
-    if [[ -n "$END_EPOCH" ]]; then
-        DAYS_LEFT=$(( (END_EPOCH - NOW_EPOCH) / 86400 ))
-
-        if (( END_EPOCH <= NOW_EPOCH )); then
-            echo "Days Left  : EXPIRED"
-        else
-            echo "Days Left  : $DAYS_LEFT days"
-        fi
     else
-        echo "Days Left  : Unknown"
+        ISSUER=$(printf '%s\n' "$CERT" |
+            openssl x509 -noout -issuer)
+
+        SUBJECT=$(printf '%s\n' "$CERT" |
+            openssl x509 -noout -subject)
+
+        START=$(printf '%s\n' "$CERT" |
+            openssl x509 -noout -startdate |
+            cut -d= -f2-)
+
+        END=$(printf '%s\n' "$CERT" |
+            openssl x509 -noout -enddate |
+            cut -d= -f2-)
+
+        SAN=$(printf '%s\n' "$CERT" |
+            openssl x509 -noout -ext subjectAltName 2>/dev/null)
+
+        END_EPOCH=$(date -u -d "$END" +%s 2>/dev/null)
+        NOW_EPOCH=$(date -u +%s)
+
+        echo "SSL Status : Certificate retrieved"
+        echo "$SUBJECT"
+        echo "$ISSUER"
+        echo "Issue Date : $START"
+        echo "Expiry Date: $END"
+        echo "SAN        :"
+        echo "$SAN"
+
+        if [[ -n "$END_EPOCH" ]]; then
+            DAYS_LEFT=$(( (END_EPOCH - NOW_EPOCH) / 86400 ))
+
+            if (( END_EPOCH <= NOW_EPOCH )); then
+                echo "Days Left  : EXPIRED"
+            else
+                echo "Days Left  : $DAYS_LEFT days"
+            fi
+        else
+            echo "Days Left  : Unknown"
+        fi
     fi
 
-    HTTP_CODE=$(curl -sS -o /dev/null \
-        --connect-timeout 5 --max-time 10 \
-        -w '%{http_code}' \
-        "http://$domain/.well-known/acme-challenge/ssl-dryrun-check" \
-        2>/dev/null)
+    echo
+    echo "========== HTTP/HTTPS RESPONSE =========="
 
-    echo "HTTP Check : ${HTTP_CODE:-000}"
+    for SCHEME in http https; do
+        curl -k -sS -o /dev/null \
+            --connect-timeout 5 \
+            --max-time 12 \
+            -w "$SCHEME | HTTP: %{http_code} | Remote IP: %{remote_ip} | Redirect: %{redirect_url}\n" \
+            "$SCHEME://$domain/" 2>/dev/null
+    done
+
+    echo
+    echo "========== ACME CHALLENGE PATH =========="
+
+    curl -k -sS -o /dev/null \
+        --connect-timeout 5 \
+        --max-time 12 \
+        -w 'HTTP: %{http_code} | Remote IP: %{remote_ip} | Redirect: %{redirect_url}\n' \
+        "http://$domain/.well-known/acme-challenge/ssl-dryrun-check" \
+        2>/dev/null
+
 done
 
 echo
-echo "=========================================="
-echo "          STARTING SSL DRY RUN"
-echo "=========================================="
+echo "=================================================="
+echo "              CERTBOT SSL DRY RUN"
+echo "=================================================="
 
 SUCCESS=0
 FAILED=0
@@ -129,9 +209,9 @@ FAILED_DOMAINS=()
 for domain in "${DOMAINS[@]}"; do
 
     echo
-    echo "------------------------------------------"
+    echo "--------------------------------------------------"
     echo "DRY RUN: $domain"
-    echo "------------------------------------------"
+    echo "--------------------------------------------------"
 
     if certbot certonly \
         --dry-run \
@@ -145,7 +225,6 @@ for domain in "${DOMAINS[@]}"; do
 
         echo "[SUCCESS] $domain"
         ((SUCCESS+=1))
-
     else
         echo "[FAILED] $domain"
         FAILED_DOMAINS+=("$domain")
@@ -154,13 +233,16 @@ for domain in "${DOMAINS[@]}"; do
 done
 
 echo
-echo "=========================================="
-echo "            FINAL SSL REPORT"
-echo "=========================================="
+echo "=================================================="
+echo "                   FINAL REPORT"
+echo "=================================================="
 
+echo
+echo "SERVER OUTBOUND PUBLIC IP: ${SERVER_IP:-UNKNOWN}"
+echo
 echo "Total Domains : ${#DOMAINS[@]}"
-echo "Successful    : $SUCCESS"
-echo "Failed        : $FAILED"
+echo "SSL Dry Success: $SUCCESS"
+echo "SSL Dry Failed : $FAILED"
 
 if (( FAILED > 0 )); then
     echo
@@ -170,7 +252,7 @@ fi
 
 echo
 echo "No production SSL certificates were issued."
-echo "=========================================="
+echo "=================================================="
 
 if (( FAILED > 0 )); then
     exit 1
