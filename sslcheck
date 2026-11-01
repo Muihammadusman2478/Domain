@@ -37,9 +37,6 @@ else
     echo "Server IP: Unable to detect"
 fi
 
-echo "Note: This is the server's outbound public IPv4."
-echo "It may differ from its inbound application IP."
-
 echo
 read -rp "Enter domain(s), separated by spaces or commas: " INPUT
 
