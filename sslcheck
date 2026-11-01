@@ -1,0 +1,177 @@
+
+#!/bin/bash
+
+WEBROOT="/opt/letsencrypt"
+
+echo "=========================================="
+echo "       SSL CHECK & CERTBOT DRY RUN"
+echo "=========================================="
+
+# Check dependencies
+for cmd in openssl certbot curl timeout date; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "ERROR: Missing command: $cmd"
+        exit 1
+    fi
+done
+
+if [[ ! -d "$WEBROOT" ]]; then
+    echo "ERROR: Webroot not found: $WEBROOT"
+    exit 1
+fi
+
+echo
+read -rp "Enter domain(s), separated by spaces or commas: " INPUT
+
+INPUT="${INPUT//,/ }"
+read -ra RAW_DOMAINS <<< "$INPUT"
+
+DOMAINS=()
+
+for domain in "${RAW_DOMAINS[@]}"; do
+    domain="${domain,,}"
+    domain="${domain%.}"
+
+    if [[ ! "$domain" =~ ^([a-z0-9-]+\.)+[a-z]{2,}$ ]]; then
+        echo "Skipping invalid domain: $domain"
+        continue
+    fi
+
+    if [[ ! " ${DOMAINS[*]} " == *" $domain "* ]]; then
+        DOMAINS+=("$domain")
+    fi
+done
+
+if [[ ${#DOMAINS[@]} -eq 0 ]]; then
+    echo "ERROR: No valid domains supplied."
+    exit 1
+fi
+
+echo
+echo "Total Domains: ${#DOMAINS[@]}"
+
+echo
+echo "=========================================="
+echo "          CURRENT SSL DETAILS"
+echo "=========================================="
+
+for domain in "${DOMAINS[@]}"; do
+
+    echo
+    echo "------------------------------------------"
+    echo "DOMAIN: $domain"
+    echo "------------------------------------------"
+
+    CERT=$(timeout 12 openssl s_client \
+        -connect "${domain}:443" \
+        -servername "$domain" \
+        -showcerts </dev/null 2>/dev/null |
+        openssl x509 -outform PEM 2>/dev/null)
+
+    if [[ -z "$CERT" ]]; then
+        echo "SSL Status : No certificate retrieved"
+        echo "Issuer     : N/A"
+        echo "Issue Date : N/A"
+        echo "Expiry Date: N/A"
+        echo "Days Left  : N/A"
+        continue
+    fi
+
+    ISSUER=$(printf '%s\n' "$CERT" |
+        openssl x509 -noout -issuer)
+
+    START=$(printf '%s\n' "$CERT" |
+        openssl x509 -noout -startdate |
+        cut -d= -f2-)
+
+    END=$(printf '%s\n' "$CERT" |
+        openssl x509 -noout -enddate |
+        cut -d= -f2-)
+
+    END_EPOCH=$(date -u -d "$END" +%s 2>/dev/null)
+    NOW_EPOCH=$(date -u +%s)
+
+    echo "SSL Status : Certificate retrieved"
+    echo "$ISSUER"
+    echo "Issue Date : $START"
+    echo "Expiry Date: $END"
+
+    if [[ -n "$END_EPOCH" ]]; then
+        DAYS_LEFT=$(( (END_EPOCH - NOW_EPOCH) / 86400 ))
+
+        if (( END_EPOCH <= NOW_EPOCH )); then
+            echo "Days Left  : EXPIRED"
+        else
+            echo "Days Left  : $DAYS_LEFT days"
+        fi
+    else
+        echo "Days Left  : Unknown"
+    fi
+
+    HTTP_CODE=$(curl -sS -o /dev/null \
+        --connect-timeout 5 --max-time 10 \
+        -w '%{http_code}' \
+        "http://$domain/.well-known/acme-challenge/ssl-dryrun-check" \
+        2>/dev/null)
+
+    echo "HTTP Check : ${HTTP_CODE:-000}"
+done
+
+echo
+echo "=========================================="
+echo "          STARTING SSL DRY RUN"
+echo "=========================================="
+
+SUCCESS=0
+FAILED=0
+FAILED_DOMAINS=()
+
+for domain in "${DOMAINS[@]}"; do
+
+    echo
+    echo "------------------------------------------"
+    echo "DRY RUN: $domain"
+    echo "------------------------------------------"
+
+    if certbot certonly \
+        --dry-run \
+        --text \
+        --non-interactive \
+        --webroot \
+        -w "$WEBROOT" \
+        --no-self-upgrade \
+        -d "$domain" \
+        --agree-tos; then
+
+        echo "[SUCCESS] $domain"
+        ((SUCCESS+=1))
+
+    else
+        echo "[FAILED] $domain"
+        FAILED_DOMAINS+=("$domain")
+        ((FAILED+=1))
+    fi
+done
+
+echo
+echo "=========================================="
+echo "            FINAL SSL REPORT"
+echo "=========================================="
+
+echo "Total Domains : ${#DOMAINS[@]}"
+echo "Successful    : $SUCCESS"
+echo "Failed        : $FAILED"
+
+if (( FAILED > 0 )); then
+    echo
+    echo "FAILED DOMAINS:"
+    printf '[FAILED] %s\n' "${FAILED_DOMAINS[@]}"
+fi
+
+echo
+echo "No production SSL certificates were issued."
+echo "=========================================="
+
+if (( FAILED > 0 )); then
+    exit 1
+fi
