@@ -1,66 +1,105 @@
+
 #!/bin/bash
 
-# Prompt user for the application name
-read -p "Enter the application name: " APP_NAME
+read -rp "Enter the application name: " APP_NAME
 
-# Define the Apache config path
 APACHE_CONF="/etc/apache2/sites-available/${APP_NAME}.conf"
-
-# Check if the Apache config exists
-if [[ ! -f "$APACHE_CONF" ]]; then
-    echo "Error: Apache configuration not found for app '$APP_NAME'." >&2
-    exit 1
-fi
-
-# Extract the DocumentRoot (webroot)
-WEBROOT=$(grep -oP '(?<=DocumentRoot\s).*' "$APACHE_CONF" | head -n 1)
-
-# Check if we found a webroot
-if [[ -z "$WEBROOT" ]]; then
-    echo "Error: Could not determine webroot for '$APP_NAME'." >&2
-    exit 1
-fi
-
-# Echo the webroot path
-echo "Webroot for '$APP_NAME': $WEBROOT"
-
-# Create 'usman.html' inside the webroot
-echo "HelloWorld" > "$WEBROOT/usman.html"
-
-# Confirm file creation
-if [[ -f "$WEBROOT/usman.html" ]]; then
-    echo "File 'usman.html' created successfully in $WEBROOT"
-else
-    echo "Failed to create 'usman.html'" >&2
-    exit 1
-fi
-
-# Define the Nginx server config path
 CONFIG_FILE="/home/master/applications/$APP_NAME/conf/server.nginx"
 
-# Check if the Nginx config file exists
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "Error: Nginx configuration file not found for app '$APP_NAME'." >&2
-    exit 1
-fi
-
-# Output files for pointed and non-pointed domains (under /tmp/)
 POINTED_DOMAINS_FILE="/tmp/pointed_domains.txt"
 NON_POINTED_DOMAINS_FILE="/tmp/non_pointed_domains.txt"
 
-# Clear the output files
+# Validate application configuration
+if [[ ! -f "$APACHE_CONF" ]]; then
+    echo "Error: Apache configuration not found for '$APP_NAME'."
+    exit 1
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Error: Nginx configuration not found for '$APP_NAME'."
+    exit 1
+fi
+
+# Extract webroot
+WEBROOT=$(awk '$1 == "DocumentRoot" {
+    print $2
+    exit
+}' "$APACHE_CONF" | tr -d '"')
+
+if [[ -z "$WEBROOT" || ! -d "$WEBROOT" ]]; then
+    echo "Error: Webroot not found."
+    exit 1
+fi
+
+echo "Webroot: $WEBROOT"
+
+# Create test file without overwriting an existing file
+TEST_FILE="$WEBROOT/usman.html"
+CREATED_TEST=0
+
+if [[ -e "$TEST_FILE" ]]; then
+    if [[ "$(cat "$TEST_FILE")" != "HelloWorld" ]]; then
+        echo "Error: Existing usman.html contains different content."
+        exit 1
+    fi
+else
+    printf 'HelloWorld\n' > "$TEST_FILE" || exit 1
+    CREATED_TEST=1
+fi
+
+cleanup() {
+    if [[ "$CREATED_TEST" -eq 1 ]]; then
+        rm -f -- "$TEST_FILE"
+    fi
+}
+trap cleanup EXIT
+
+# Clear previous results
 > "$POINTED_DOMAINS_FILE"
 > "$NON_POINTED_DOMAINS_FILE"
 
-# Extract domains and check for "HelloWorld" response
-grep -oP '(?<=server_name\s)[^;]+' "$CONFIG_FILE" | tr -s ' ' '\n' | sort -u | while read domain; do
-    response=$(curl -sk --max-time 5 "https://$domain/usman.html" 2>/dev/null)
-    if [[ "$response" == "HelloWorld" ]]; then
-        echo "[✔] $domain" >> "$POINTED_DOMAINS_FILE"
-    else
-        echo "[✘] $domain" >> "$NON_POINTED_DOMAINS_FILE"
-    fi
-done
+echo
+echo "========== CHECKING DOMAINS =========="
 
-echo "Pointed domains saved to $POINTED_DOMAINS_FILE"
-echo "Non-pointed domains saved to $NON_POINTED_DOMAINS_FILE"
+while IFS= read -r domain; do
+    [[ -z "$domain" || "$domain" == _* || "$domain" == *'*'* ]] && continue
+
+    response=$(curl -skL --max-time 5 \
+        "https://$domain/usman.html" 2>/dev/null)
+
+    if [[ "$response" == "HelloWorld" ]]; then
+        echo "[✔] $domain" | tee -a "$POINTED_DOMAINS_FILE"
+    else
+        echo "[✘] $domain" | tee -a "$NON_POINTED_DOMAINS_FILE"
+    fi
+
+done < <(
+    grep -oP '(?<=server_name\s)[^;]+' "$CONFIG_FILE" |
+    tr -s '[:space:]' '\n' |
+    sort -u
+)
+
+echo
+echo "========================================="
+echo "          FINAL DOMAIN REPORT"
+echo "========================================="
+
+echo
+echo "========== POINTED DOMAINS =========="
+cat "$POINTED_DOMAINS_FILE"
+
+echo
+echo "========== NON-POINTED DOMAINS =========="
+cat "$NON_POINTED_DOMAINS_FILE"
+
+echo
+echo "========== SUMMARY =========="
+echo "Pointed Domains: $(wc -l < "$POINTED_DOMAINS_FILE")"
+echo "Non-Pointed Domains: $(wc -l < "$NON_POINTED_DOMAINS_FILE")"
+
+echo
+echo "========== OUTPUT FILES =========="
+echo "$POINTED_DOMAINS_FILE"
+echo "$NON_POINTED_DOMAINS_FILE"
+
+echo "========================================="
