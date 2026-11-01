@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+
+set -u
+
+# ==========================================
+# CLOUDWAYS PHP-FPM OPCACHE CHECK
+# Auto-install cgi-fcgi if missing
+# Temporary PHP files: /tmp
+# ==========================================
+
+TMP_DIR="/tmp"
+FACT="/etc/ansible/facts.d/server_settings.fact"
+
+CHECKED=0
+SUCCESS=0
+FAILED=0
+INSTALLED="No"
+
+declare -a TEMP_FILES=()
+declare -A TARGETS=()
+
+# ==========================================
+# CLEANUP
+# ==========================================
+
+cleanup() {
+    for file in "${TEMP_FILES[@]}"; do
+        [[ -f "$file" ]] && rm -f -- "$file"
+    done
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ==========================================
+# HEADER
+# ==========================================
+
+echo
+echo "================================================"
+echo "       CLOUDWAYS OPCACHE HEALTH CHECK"
+echo "================================================"
+echo "Server : $(hostname)"
+echo "Date   : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "================================================"
+
+# ==========================================
+# ROOT CHECK
+# ==========================================
+
+if [[ $EUID -ne 0 ]]; then
+    echo "[ERROR] Please run this script as root."
+    exit 1
+fi
+
+# ==========================================
+# REQUIRED UTILITIES
+# ==========================================
+
+for cmd in awk grep sort mktemp timeout apt-get; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "[ERROR] Required command missing: $cmd"
+        exit 1
+    fi
+done
+
+if [[ ! -d "$TMP_DIR" || ! -w "$TMP_DIR" ]]; then
+    echo "[ERROR] /tmp is not writable."
+    exit 1
+fi
+
+# ==========================================
+# CHECK & INSTALL CGI-FCGI
+# ==========================================
+
+echo
+echo "========== DEPENDENCY CHECK =========="
+
+if command -v cgi-fcgi >/dev/null 2>&1; then
+    echo "[OK] cgi-fcgi is already installed."
+else
+    echo "[MISSING] cgi-fcgi is not installed."
+    echo "[INFO] Required package: libfcgi-bin"
+    echo "[INFO] Updating APT package index..."
+
+    APT_LOG=$(mktemp "$TMP_DIR/opcache-apt-XXXXXXXX.log") || exit 1
+    TEMP_FILES+=("$APT_LOG")
+
+    if DEBIAN_FRONTEND=noninteractive \
+        apt-get update >"$APT_LOG" 2>&1; then
+        echo "[OK] APT package index updated."
+    else
+        echo "[ERROR] apt-get update failed."
+        tail -15 "$APT_LOG"
+        exit 1
+    fi
+
+    echo "[INFO] Installing libfcgi-bin..."
+
+    if DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y libfcgi-bin >"$APT_LOG" 2>&1; then
+        echo "[OK] Package installation completed."
+    else
+        echo "[ERROR] Package installation failed."
+        tail -20 "$APT_LOG"
+        exit 1
+    fi
+
+    if ! command -v cgi-fcgi >/dev/null 2>&1; then
+        echo "[ERROR] cgi-fcgi still unavailable."
+        exit 1
+    fi
+
+    INSTALLED="Yes"
+    echo "[SUCCESS] cgi-fcgi is now available."
+fi
+
+# ==========================================
+# DETECT PHP MODE
+# ==========================================
+
+MULTI=$(awk -F= '
+/^[[:space:]]*multi_app_php[[:space:]]*=/ {
+    gsub(/[[:space:]]/, "", $2)
+    print $2
+    exit
+}' "$FACT" 2>/dev/null)
+
+case "$MULTI" in
+    yes)
+        MODE="MultiPHP"
+        ;;
+    no)
+        MODE="Single PHP"
+        ;;
+    *)
+        MODE="Unknown"
+        ;;
+esac
+
+echo
+echo "========== PHP ENVIRONMENT =========="
+echo "PHP Mode: $MODE"
+
+if [[ "$MODE" == "Unknown" ]]; then
+    echo "[INFO] PHP mode fact unavailable."
+    echo "[INFO] Checking discovered PHP versions."
+fi
+
+# ==========================================
+# DISCOVER PHP-FPM SOCKETS
+# ==========================================
+
+for conf in /etc/php/*/fpm/pool.d/*.conf; do
+
+    [[ -f "$conf" ]] || continue
+
+    VERSION=${conf#/etc/php/}
+    VERSION=${VERSION%%/*}
+
+    POOL=$(basename "$conf" .conf)
+    APP=${POOL%-[0-9]*}
+
+    [[ "$APP" =~ ^[a-z0-9]+$ ]] || continue
+
+    SOCKET=$(awk -F= '
+    /^[[:space:]]*listen[[:space:]]*=/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+        print $2
+        exit
+    }' "$conf")
+
+    [[ "$SOCKET" == /* && -S "$SOCKET" ]] || continue
+
+    KEY="$VERSION"
+
+    if [[ ! -v TARGETS[$KEY] ]]; then
+        TARGETS[$KEY]="$SOCKET|$VERSION|$POOL"
+    fi
+
+done
+
+# ==========================================
+# LEGACY FALLBACK
+# ==========================================
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+
+    for SOCKET in \
+        /run/fpm-cloudways.sock \
+        /var/run/fpm-cloudways.sock; do
+
+        if [[ -S "$SOCKET" ]]; then
+            TARGETS["legacy"]="$SOCKET|default|legacy"
+            break
+        fi
+
+    done
+
+fi
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    echo "[ERROR] No compatible PHP-FPM sockets found."
+    exit 1
+fi
+
+echo "PHP Targets Found: ${#TARGETS[@]}"
+
+# ==========================================
+# PHP OPCACHE DIAGNOSTIC PAYLOAD
+# ==========================================
+
+PHP_CODE=$(cat <<'PHP'
+<?php
+
+header('Content-Type: text/plain; charset=UTF-8');
+
+if (!function_exists('opcache_get_status')) {
+    echo "ERROR: OPcache extension missing\n";
+    exit;
+}
+
+$s = opcache_get_status(false);
+
+if (!$s || empty($s['opcache_enabled'])) {
+    echo "ERROR: OPcache disabled or inaccessible\n";
+    exit;
+}
+
+$m = $s['memory_usage'] ?? [];
+$i = $s['interned_strings_usage'] ?? [];
+$t = $s['opcache_statistics'] ?? [];
+
+$mb = 1048576;
+
+$used = $m['used_memory'] ?? 0;
+$free = $m['free_memory'] ?? 0;
+$wasted = $m['wasted_memory'] ?? 0;
+
+$total = $used + $free + $wasted;
+
+echo "=== OPCACHE REPORT ===\n";
+
+printf("PHP Version       : %s\n", PHP_VERSION);
+printf("SAPI              : %s\n", PHP_SAPI);
+printf("OPcache           : Enabled\n");
+
+echo "\n--- Memory ---\n";
+
+printf("Total Memory      : %.2f MB\n", $total/$mb);
+printf("Used Memory       : %.2f MB\n", $used/$mb);
+printf("Free Memory       : %.2f MB\n", $free/$mb);
+printf("Wasted Memory     : %.2f MB\n", $wasted/$mb);
+
+printf(
+    "Memory Usage      : %.2f%%\n",
+    $total > 0 ? $used/$total*100 : 0
+);
+
+echo "\n--- Interned Strings ---\n";
+
+printf(
+    "Allocated         : %.2f MB\n",
+    ($i['buffer_size'] ?? 0)/$mb
+);
+
+printf(
+    "Used              : %.2f MB\n",
+    ($i['used_memory'] ?? 0)/$mb
+);
+
+printf(
+    "Free              : %.2f MB\n",
+    ($i['free_memory'] ?? 0)/$mb
+);
+
+printf(
+    "Strings           : %d\n",
+    $i['number_of_strings'] ?? 0
+);
+
+echo "\n--- Cache Statistics ---\n";
+
+printf(
+    "Cached Scripts    : %d\n",
+    $t['num_cached_scripts'] ?? 0
+);
+
+printf(
+    "Cached Keys       : %d / %d\n",
+    $t['num_cached_keys'] ?? 0,
+    $t['max_cached_keys'] ?? 0
+);
+
+printf("Hits              : %d\n", $t['hits'] ?? 0);
+printf("Misses            : %d\n", $t['misses'] ?? 0);
+
+printf(
+    "Hit Rate          : %.2f%%\n",
+    $t['opcache_hit_rate'] ?? 0
+);
+
+echo "\n--- Restart Counters ---\n";
+
+printf("OOM Restarts      : %d\n", $t['oom_restarts'] ?? 0);
+printf("Hash Restarts     : %d\n", $t['hash_restarts'] ?? 0);
+printf("Manual Restarts   : %d\n", $t['manual_restarts'] ?? 0);
+
+echo "\n--- Cache Health ---\n";
+
+printf(
+    "Cache Full        : %s\n",
+    !empty($s['cache_full']) ? 'Yes' : 'No'
+);
+
+printf(
+    "Restart Pending   : %s\n",
+    !empty($s['restart_pending']) ? 'Yes' : 'No'
+);
+
+printf(
+    "Restart Running   : %s\n",
+    !empty($s['restart_in_progress']) ? 'Yes' : 'No'
+);
+
+echo "=== END OPCACHE REPORT ===\n";
+PHP
+)
+
+# ==========================================
+# EXECUTE THROUGH PHP-FPM
+# ==========================================
+
+echo
+echo "========== OPCACHE DIAGNOSTICS =========="
+
+while IFS= read -r KEY; do
+
+    IFS='|' read -r SOCKET VERSION POOL <<< "${TARGETS[$KEY]}"
+
+    CHECKED=$((CHECKED + 1))
+
+    echo
+    echo "------------------------------------------------"
+    echo "PHP Version : $VERSION"
+    echo "PHP Pool    : $POOL"
+    echo "Socket      : $SOCKET"
+    echo "------------------------------------------------"
+
+    FILE=$(mktemp "$TMP_DIR/opcache-audit-XXXXXXXX.php") || {
+        echo "[FAILED] Cannot create temporary PHP file."
+        FAILED=$((FAILED + 1))
+        continue
+    }
+
+    TEMP_FILES+=("$FILE")
+
+    if ! printf '%s\n' "$PHP_CODE" > "$FILE"; then
+        echo "[FAILED] Cannot write PHP diagnostic file."
+        FAILED=$((FAILED + 1))
+        continue
+    fi
+
+    chmod 644 "$FILE" || {
+        echo "[FAILED] Cannot set temporary file permissions."
+        FAILED=$((FAILED + 1))
+        continue
+    }
+
+    OUTPUT=$(
+        SCRIPT_FILENAME="$FILE" \
+        SCRIPT_NAME="/$(basename "$FILE")" \
+        DOCUMENT_ROOT="$TMP_DIR" \
+        REQUEST_METHOD=GET \
+        REDIRECT_STATUS=200 \
+        timeout 15 cgi-fcgi -bind -connect "$SOCKET" 2>&1
+    )
+
+    STATUS=$?
+
+    if [[ $STATUS -eq 0 ]] &&
+       grep -q '^SAPI *: fpm-fcgi' <<< "$OUTPUT" &&
+       grep -q '^=== END OPCACHE REPORT ===' <<< "$OUTPUT"; then
+
+        printf '%s\n' "$OUTPUT" |
+            sed -n '/^=== OPCACHE REPORT ===/,/^=== END OPCACHE REPORT ===/p' |
+            sed '/^=== OPCACHE REPORT ===/d; /^=== END OPCACHE REPORT ===/d'
+
+        echo
+        echo "[SUCCESS] OPcache check completed."
+
+        SUCCESS=$((SUCCESS + 1))
+
+    else
+
+        echo "[FAILED] Unable to read OPcache."
+        echo "Possible causes:"
+        echo " - PHP-FPM access restriction"
+        echo " - /tmp blocked by open_basedir"
+        echo " - Socket permission issue"
+        echo " - OPcache disabled"
+        echo " - PHP execution timeout"
+
+        echo
+        echo "Diagnostic details:"
+        printf '%s\n' "$OUTPUT" | tail -12
+
+        FAILED=$((FAILED + 1))
+
+    fi
+
+    rm -f -- "$FILE"
+
+done < <(printf '%s\n' "${!TARGETS[@]}" | sort -V)
+
+# ==========================================
+# FINAL SUMMARY
+# ==========================================
+
+echo
+echo "================================================"
+echo "                  FINAL SUMMARY"
+echo "================================================"
+echo "Server           : $(hostname)"
+echo "PHP Mode         : $MODE"
+echo "cgi-fcgi Installed: $INSTALLED"
+echo "PHP Targets      : ${#TARGETS[@]}"
+echo "Checked          : $CHECKED"
+echo "Successful       : $SUCCESS"
+echo "Failed           : $FAILED"
+echo "Temporary Files  : Cleanup requested"
+echo "PHP Restart      : Not requested"
+echo "OPcache Reset    : Not requested"
+echo "================================================"
+
+if (( FAILED > 0 )); then
+    exit 1
+fi
+
+exit 0
